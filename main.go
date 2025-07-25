@@ -113,11 +113,25 @@ func udpListen(ctx context.Context) net.PacketConn {
 			if text == "hello" {
 				ip := getIP(addr)
 				port := getUDPPort(addr)
+				key := ip + fmt.Sprint(port)
+
 				udpLock.Lock()
-				udpPorts[ip+fmt.Sprint(port)] = port
+				udpPorts[key] = port
 				udpLock.Unlock()
+
 				fmt.Printf("👋 UDP hello from %s:%d\n", ip, port)
+
+				// Respond with the visible remote port (NAT source port)
+				response := map[string]any{
+					"your_udp_port": port,
+				}
+				jsonBytes, err := json.Marshal(response)
+				if err == nil {
+					pc.WriteTo(jsonBytes, addr)
+					fmt.Printf("📤 Sent UDP response to %s:%d → %s\n", ip, port, jsonBytes)
+				}
 			}
+
 		}
 	}
 }
