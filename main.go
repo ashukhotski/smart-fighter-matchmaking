@@ -2,36 +2,40 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const (
-	tcpPort              = ":9999"
-	udpPort              = ":9998"
-	maxReconnectsPerIP   = 5
-	reconnectWindow      = 5 * time.Second
-	maxConnectionsPerIP  = 3
-	totalConnLimit       = 500
+	tcpPort             = ":9999"
+	udpPort             = ":9998"
+	maxReconnectsPerIP  = 5
+	reconnectWindow     = 5 * time.Second
+	maxConnectionsPerIP = 3
+	totalConnLimit      = 500
 )
 
 type Player struct {
-	tcpConn  net.Conn
-	ip       string
-	udpPort  int
-	addr     *net.TCPAddr
+	tcpConn net.Conn
+	ip      string
+	udpPort int
+	addr    *net.TCPAddr
 }
 
 var (
-	waitingQueue          []*Player
-	udpPorts              = make(map[string]int)       // IP → last known UDP port
-	reconnectTimestamps   = make(map[string][]time.Time)
-	connCounts            = make(map[string]int)
-	activeConnections     = 0
+	waitingQueue        []*Player
+	udpPorts            = make(map[string]int) // IP → last known UDP port
+	reconnectTimestamps = make(map[string][]time.Time)
+	connCounts          = make(map[string]int)
+	activeConnections   = 0
 
 	queueLock      sync.Mutex
 	connCountsLock sync.Mutex
@@ -39,55 +43,108 @@ var (
 )
 
 func main() {
-	go udpListen() // Start UDP listener
-	tcpListen()    // Run TCP matchmaking
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Listen for system signals (e.g. Ctrl+C)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGTSTP)
+
+	// TCP and UDP listener references
+	var tcpLn net.Listener
+	var udpLn net.PacketConn
+	var wg sync.WaitGroup
+
+	go func() {
+		<-sigChan
+		fmt.Println("\n🛑 Shutting down gracefully...")
+		cancel()
+		if tcpLn != nil {
+			tcpLn.Close()
+		}
+		if udpLn != nil {
+			udpLn.Close()
+		}
+	}()
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		udpLn = udpListen(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		tcpLn = tcpListen(ctx)
+	}()
+
+	wg.Wait()
+	fmt.Println("✅ Clean shutdown complete.")
 }
 
-func udpListen() {
+func udpListen(ctx context.Context) net.PacketConn {
 	pc, err := net.ListenPacket("udp", udpPort)
 	if err != nil {
 		panic(err)
 	}
-	defer pc.Close()
 	fmt.Println("📡 UDP listener on", udpPort)
+
+	go func() {
+		<-ctx.Done()
+		fmt.Println("📴 Closing UDP listener")
+		pc.Close()
+	}()
 
 	buf := make([]byte, 1024)
 	for {
-		n, addr, err := pc.ReadFrom(buf)
-		if err != nil {
-			fmt.Println("UDP read error:", err)
-			continue
-		}
-		text := strings.TrimSpace(string(buf[:n]))
-		if text == "hello" {
-			ip := getIP(addr)
-			port := getUDPPort(addr)
-
-			udpLock.Lock()
-			udpPorts[ip+fmt.Sprint(port)] = port
-			udpLock.Unlock()
-
-			fmt.Printf("👋 UDP hello from %s:%d\n", ip, port)
+		select {
+		case <-ctx.Done():
+			return pc
+		default:
+			pc.SetReadDeadline(time.Now().Add(1 * time.Second)) // unblock on shutdown
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				if os.IsTimeout(err) || ctx.Err() != nil {
+					continue
+				}
+				fmt.Println("UDP read error:", err)
+				continue
+			}
+			text := strings.TrimSpace(string(buf[:n]))
+			if text == "hello" {
+				ip := getIP(addr)
+				port := getUDPPort(addr)
+				udpLock.Lock()
+				udpPorts[ip+fmt.Sprint(port)] = port
+				udpLock.Unlock()
+				fmt.Printf("👋 UDP hello from %s:%d\n", ip, port)
+			}
 		}
 	}
 }
 
-func tcpListen() {
+func tcpListen(ctx context.Context) net.Listener {
 	ln, err := net.Listen("tcp", tcpPort)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("🧠 TCP matchmaking listening on", tcpPort)
 
+	go func() {
+		<-ctx.Done()
+		fmt.Println("📴 Closing TCP listener")
+		ln.Close()
+	}()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ln // context was canceled
+			}
 			fmt.Println("TCP accept error:", err)
 			continue
 		}
 
 		ip := getIP(conn.RemoteAddr())
-
 		if !allowConnection(ip) {
 			fmt.Println("🚫 Connection blocked:", ip)
 			conn.Close()
@@ -121,7 +178,6 @@ func handlePlayer(conn net.Conn) {
 	}
 	line = strings.TrimSpace(line)
 	fmt.Println("📩 Received from client:", line)
-
 
 	var msg map[string]interface{}
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
