@@ -109,7 +109,7 @@ func udpListen(ctx context.Context) net.PacketConn {
 				continue
 			}
 			text := strings.TrimSpace(string(buf[:n]))
-			fmt.Printf("UDP text \"%s\" received from %s:%d", text, getIP(addr), getUDPPort(addr))
+			fmt.Printf("UDP text \"%s\" received from %s:%d\n", text, getIP(addr), getUDPPort(addr))
 			if text == "hello" {
 				ip := getIP(addr)
 				port := getUDPPort(addr)
